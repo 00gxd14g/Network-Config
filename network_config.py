@@ -1,17 +1,19 @@
 import subprocess
 import re
+import yaml
+import os
 from tabulate import tabulate
 from termcolor import colored
 
 def run_command(command):
     """
     Executes the given command and returns its output.
-    If there's an error, returns the error instead.
+    If there's an error, returns the error message.
     """
     try:
-        return subprocess.check_output(command, shell=True).decode('utf-8')
+        return subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT).decode('utf-8')
     except subprocess.CalledProcessError as e:
-        return str(e)
+        return e.output.decode('utf-8')
 
 def get_network_interfaces():
     """
@@ -21,72 +23,69 @@ def get_network_interfaces():
     interfaces = re.findall(r'\d+: ([^:]+):', interfaces_output)
     return interfaces
 
-def get_ip_addresses():
+def get_current_network_config(interface):
     """
-    Fetches and returns a list of IP addresses assigned to network interfaces.
-    Uses the 'ip addr' command and extracts the interface names and their corresponding IP addresses.
+    Uses the 'ip addr show' command to get the current IP configuration of the given interface.
+    If the interface is using DHCP, it fetches the current IP address, gateway, and netmask.
     """
-    ip_output = run_command('ip addr')
-    ips = re.findall(r'\d+: ([^:]+):.*?inet (\S+)', ip_output, re.DOTALL)
-    return ips
+    ip_output = run_command(f'ip addr show {interface}')
+    cidr = re.search(r'inet (\S+)', ip_output)
+    gateway_output = run_command('ip route')
+    gateway = re.search(r'default via (\S+)', gateway_output)
+    return {
+        'cidr': cidr.group(1) if cidr else 'Not set/Using DHCP',
+        'gateway': gateway.group(1) if gateway else 'Not detected'
+    }
 
-def get_dns_settings():
+def configure_network(interface, new_ip, gateway, dns_servers):
     """
-    Fetches and returns the current DNS settings using the 'systemd-resolve --status' command.
-    In case of an error (e.g., command not found), returns the error message.
+    Configures the network settings for the given interface using Netplan.
+    Sets a static IP address, gateway, and DNS servers.
     """
-    try:
-        dns_output = run_command('systemd-resolve --status')
-        return dns_output
-    except Exception as e:
-        return str(e)
-
-def display_data(data, headers):
-    """
-    Displays the given data in a table format using the tabulate library.
-    Accepts data as a list of tuples and headers as a list of strings.
-    """
-    print(tabulate(data, headers=headers, tablefmt="grid"))
-
-def configure_network():
-    """
-    Provides an interface for configuring network settings such as IP address and gateway.
-    Asks the user for the interface, new IP address, and default gateway, then applies these settings.
-    """
-    print(colored("\nConfiguration Options:", 'yellow'))
-    interface = input(colored("Enter the name of the interface you want to configure: ", 'green'))
-    new_ip = input(colored("Enter the new IP address (e.g., 192.168.1.10/24): ", 'green'))
-    gateway = input(colored("Enter the default gateway (e.g., 192.168.1.1): ", 'green'))
-
-    ip_cmd = f"sudo ip addr add {new_ip} dev {interface}"
-    gw_cmd = f"sudo ip route add default via {gateway}"
-
-    print(colored("\nApplying configuration...", 'blue'))
-    print(run_command(ip_cmd))
-    print(run_command(gw_cmd))
-    print(colored("Configuration completed.", 'green'))
+    config_path = f'/etc/netplan/01-netcfg-{interface}.yaml'
+    config = {
+        'network': {
+            'version': 2,
+            'renderer': 'networkd',
+            'ethernets': {
+                interface: {
+                    'dhcp4': False,
+                    'addresses': [new_ip],
+                    'gateway4': gateway,
+                    'nameservers': {
+                        'addresses': dns_servers.split(',')
+                    }
+                }
+            }
+        }
+    }
+    
+    with open(config_path, 'w') as file:
+        yaml.dump(config, file)
+    
+    print(colored("\nApplying configuration with Netplan...", 'blue'))
+    apply_result = run_command('sudo netplan apply')
+    print(apply_result if apply_result else colored("Configuration applied successfully.", 'green'))
 
 def main():
-    """
-    Main function to execute the script.
-    Displays current network interfaces, IP addresses, and DNS settings.
-    Then asks the user if they want to change the configuration, and proceeds accordingly.
-    """
     print(colored("Current Network Interfaces:", 'blue'))
     interfaces = get_network_interfaces()
-    display_data([(i, intf) for i, intf in enumerate(interfaces, 1)], ["Index", "Interface"])
+    display_data = [(i, intf) for i, intf in enumerate(interfaces, 1)]
+    print(tabulate(display_data, headers=["Index", "Interface"], tablefmt="grid"))
 
-    print(colored("\nCurrent IP Addresses:", 'blue'))
-    ip_addresses = get_ip_addresses()
-    display_data(ip_addresses, ["Interface", "IP Address"])
+    selected_index = int(input(colored("\nEnter the index of the interface you want to configure: ", 'green'))) - 1
+    selected_interface = interfaces[selected_index]
 
-    print(colored("\nCurrent DNS Settings:", 'blue'))
-    dns_settings = get_dns_settings()
-    print(dns_settings)
+    current_config = get_current_network_config(selected_interface)
+    print(colored(f"\nCurrent configuration for {selected_interface}:", 'blue'))
+    print(f"IP Address/Netmask: {current_config['cidr']}")
+    print(f"Gateway: {current_config['gateway']}")
 
-    change_config = input(colored("\nDo you want to change the configuration? (yes/no): ", 'green')).strip().lower()
-    if change_config == 'yes':
-        configure_network()
+    new_ip = input(colored("\nEnter the new IP address with CIDR notation (e.g., 192.168.1.10/24): ", 'green'))
+    gateway = input(colored("Enter the default gateway (e.g., 192.168.1.1): ", 'green'))
+    dns_servers = input(colored("Enter DNS servers separated by comma (e.g., 8.8.8.8,8.8.4.4): ", 'green'))
+
+    configure_network(selected_interface, new_ip, gateway, dns_servers)
 
 if __name__ == "__main__":
     main()
